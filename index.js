@@ -1,108 +1,1210 @@
-import { parse } from 'cookie'
-import { Redis } from '@upstash/redis/cloudflare'
+import { renderWaitingRoomHtml } from './waiting-room-template.js'
+import {
+  ADMIN_CAPACITY_PATH,
+  handleAdminRequest,
+  isAdminRequestPath,
+} from './admin.js'
 
-const redis = Redis.fromEnv()
-
-addEventListener('fetch', event => {
-  event.respondWith(
-    handleRequest(event.request).catch(
-      err => new Response(err.stack, { status: 500 }),
-    ),
-  )
+const COOKIE_NAME_SESSION = '__waiting_room_session'
+const COOKIE_NAME_QUEUE = '__waiting_room_queue'
+const COOKIE_TOKEN_VERSION = 'v1'
+const COOKIE_TOKEN_ALGORITHM = { name: 'HMAC', hash: 'SHA-256' }
+const COOKIE_ATTRIBUTES = ['Path=/', 'HttpOnly', 'Secure', 'SameSite=Lax']
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+const signingKeyCache = new Map()
+const configCache = new WeakMap()
+const OBSERVABILITY_COMPONENT = 'waiting_room'
+const OBSERVABILITY_LEVELS = Object.freeze({
+  none: 0,
+  error: 1,
+  info: 2,
+  debug: 3,
 })
+const OBSERVABILITY_EVENT_CONFIG = Object.freeze({
+  admission_granted: { level: 'info', sampleable: false },
+  session_refreshed: { level: 'debug', sampleable: true },
+  queue_entered: { level: 'info', sampleable: true },
+  offer_issued: { level: 'info', sampleable: false },
+  sessions_expired: { level: 'info', sampleable: false },
+  offers_expired: { level: 'info', sampleable: false },
+  queue_entries_expired: { level: 'info', sampleable: false },
+})
+const DEFAULT_CONFIG = Object.freeze({
+  sessionDurationSeconds: 30,
+  waitingRoomRefreshSeconds: 20,
+})
+const DEFAULT_TOTAL_ACTIVE_USERS = 1
 
-const COOKIE_NAME_ID = '__waiting_room_id'
-const COOKIE_NAME_TIME = '__waiting_room_last_update_time'
-
-async function handleRequest(request) {
-  const { pathname } = new URL(request.url)
-  if (!pathname.startsWith('/favicon')) {
-    const cookie = parse(request.headers.get('Cookie') || '')
-    const userId = cookie[COOKIE_NAME_ID] || crypto.randomUUID()
-
-    const size = await redis.dbsize()
-    console.log('current capacity:' + size)
-    // there is enough capacity
-    if (size < TOTAL_ACTIVE_USERS) {
-      return getDefaultResponse(request, cookie, userId)
-    } else {
-      // site capacity is full
-      let hasActiveSession = await redis.get(userId)
-      if (hasActiveSession) {
-        // the user has already active session
-        return getDefaultResponse(request, cookie, userId)
-      } else {
-        // capacity is full so the user is forwarded to waiting room
-        return getWaitingRoomResponse(userId)
-      }
+export default {
+  async fetch(request, env) {
+    try {
+      getConfig(env)
+      return await handleRequest(request, env)
+    } catch (error) {
+      console.error('waiting-room request failed', error)
+      return new Response('Internal Server Error', { status: 500 })
     }
-  } else {
-    return fetch(request)
-  }
+  },
 }
 
-async function getDefaultResponse(request, cookie, userId) {
-  // uncomment below to test the function with a static html content
-  // const newResponse = new Response(default_html)
-  // newResponse.headers.append('content-type', 'text/html;charset=UTF-8')
+export class WaitingRoom {
+  constructor(state, env) {
+    this.state = state
+    this.env = env
+    this.config = getConfig(env)
+    this.storage = state.storage
+    this.sql = state.storage.sql
 
-  const response = await fetch(request)
-  const newResponse = new Response(response.body, response)
+    state.blockConcurrencyWhile(async () => {
+      this.initializeSchema()
+    })
+  }
 
-  const now = Date.now()
-  const lastUpdate = cookie[COOKIE_NAME_TIME] || 0
-  const diff = now - lastUpdate
-  const updateInterval = (SESSION_DURATION_SECONDS * 1000) / 2
-  if (diff > updateInterval) {
-    await redis.setex(userId, SESSION_DURATION_SECONDS, true)
-    newResponse.headers.append(
-      'Set-Cookie',
-      `${COOKIE_NAME_TIME}=${now}; path=/`,
+  async fetch(request) {
+    const url = new URL(request.url)
+    if (request.method === 'POST' && url.pathname === '/admit') {
+      const payload = await request.json()
+      const response =
+        payload?.mode === 'refresh'
+          ? await this.handleSessionRefresh(payload)
+          : await this.handleAdmission(payload)
+      return json(response)
+    }
+    if (url.pathname === ADMIN_CAPACITY_PATH) {
+      if (request.method === 'GET') {
+        return json(this.getAdminStats())
+      }
+      if (request.method === 'POST') {
+        const payload = await request.json()
+        const response = await this.handleCapacityUpdate(payload)
+        return json(response)
+      }
+    }
+
+    return new Response('Not Found', { status: 404 })
+  }
+
+  async alarm() {
+    const now = Date.now()
+    await this.cleanupExpired(now)
+    await this.advanceQueue(now)
+    await this.scheduleNextAlarm(now)
+  }
+
+  async handleAdmission(payload) {
+    const now = Number(payload.now) || Date.now()
+    const sessionTtlMs = this.getSessionDurationMs()
+    await this.cleanupExpired(now)
+
+    const sessionId = payload.sessionId || null
+    const queueId = payload.queueId || null
+    const activeSession = sessionId ? this.getSession(sessionId) : null
+
+    if (activeSession && activeSession.expiresAt > now) {
+      this.sql.exec(
+        `UPDATE sessions SET expires_at = ? WHERE session_id = ?`,
+        now + sessionTtlMs,
+        sessionId,
+      )
+      this.logEvent('session_refreshed', {
+        now,
+        sessionId,
+        sessionExpiresAt: now + sessionTtlMs,
+      })
+      await this.advanceQueue(now)
+      await this.scheduleNextAlarm(now)
+      return {
+        decision: 'admit',
+        sessionId,
+        sessionExpiresAt: now + sessionTtlMs,
+        refreshSeconds: this.getRefreshSeconds(),
+      }
+    }
+
+    await this.advanceQueue(now)
+
+    const queueEntry = queueId ? this.getQueueEntry(queueId) : null
+    const activeOffer = queueId ? this.getOffer(queueId) : null
+
+    if (queueEntry && activeOffer && activeOffer.expiresAt > now) {
+      return this.claimOffer(queueEntry, activeOffer, now, sessionTtlMs)
+    }
+
+    const queueDepth = this.getScalar(
+      `SELECT COUNT(*) AS count FROM queue_entries`,
+      'count',
+    )
+    const offerCount = this.getScalar(
+      `SELECT COUNT(*) AS count FROM offers`,
+      'count',
+    )
+    const activeSessionCount = this.getScalar(
+      `SELECT COUNT(*) AS count FROM sessions`,
+      'count',
+    )
+
+    if (
+      queueDepth === 0 &&
+      offerCount === 0 &&
+      activeSessionCount < this.getCapacity()
+    ) {
+      const admittedSessionId = crypto.randomUUID()
+      this.sql.exec(
+        `INSERT INTO sessions (session_id, created_at, expires_at) VALUES (?, ?, ?)`,
+        admittedSessionId,
+        now,
+        now + sessionTtlMs,
+      )
+      this.logEvent('admission_granted', {
+        now,
+        admissionSource: 'immediate',
+        sessionId: admittedSessionId,
+        sessionExpiresAt: now + sessionTtlMs,
+        counters: {
+          admissions: 1,
+        },
+      })
+      await this.scheduleNextAlarm(now)
+
+      return {
+        decision: 'admit',
+        sessionId: admittedSessionId,
+        sessionExpiresAt: now + sessionTtlMs,
+        refreshSeconds: this.getRefreshSeconds(),
+      }
+    }
+
+    const waitingEntry = queueEntry || this.createQueueEntry(queueId, now)
+    if (!queueEntry) {
+      this.logEvent('queue_entered', {
+        now,
+        queueId: waitingEntry.queueId,
+        ticket: waitingEntry.ticket,
+      })
+    }
+    this.sql.exec(
+      `UPDATE queue_entries SET last_seen_at = ? WHERE queue_id = ?`,
+      now,
+      waitingEntry.queueId,
+    )
+
+    await this.advanceQueue(now)
+
+    const refreshedOffer = this.getOffer(waitingEntry.queueId)
+    if (refreshedOffer && refreshedOffer.expiresAt > now) {
+      return this.claimOffer(waitingEntry, refreshedOffer, now, sessionTtlMs)
+    }
+
+    const position = this.getQueuePosition(waitingEntry.ticket)
+
+    await this.scheduleNextAlarm(now)
+
+    return {
+      decision: 'wait',
+      queueId: waitingEntry.queueId,
+      position,
+      refreshSeconds: this.getRefreshSeconds(),
+      offerExpiresAt: refreshedOffer?.expiresAt ?? null,
+    }
+  }
+
+  async claimOffer(queueEntry, activeOffer, now, sessionTtlMs) {
+    const admittedSessionId = crypto.randomUUID()
+    this.sql.exec(
+      `INSERT INTO sessions (session_id, created_at, expires_at) VALUES (?, ?, ?)`,
+      admittedSessionId,
+      now,
+      now + sessionTtlMs,
+    )
+    this.sql.exec(`DELETE FROM offers WHERE queue_id = ?`, queueEntry.queueId)
+    this.sql.exec(
+      `DELETE FROM queue_entries WHERE queue_id = ?`,
+      queueEntry.queueId,
+    )
+
+    this.logEvent('admission_granted', {
+      now,
+      admissionSource: 'offer_claim',
+      queueId: queueEntry.queueId,
+      ticket: queueEntry.ticket,
+      sessionId: admittedSessionId,
+      sessionExpiresAt: now + sessionTtlMs,
+      offerExpiresAt: activeOffer.expiresAt,
+      counters: {
+        admissions: 1,
+      },
+    })
+
+    await this.advanceQueue(now)
+    await this.scheduleNextAlarm(now)
+
+    return {
+      decision: 'admit',
+      sessionId: admittedSessionId,
+      sessionExpiresAt: now + sessionTtlMs,
+      refreshSeconds: this.getRefreshSeconds(),
+    }
+  }
+
+  async handleSessionRefresh(payload) {
+    const now = Number(payload.now) || Date.now()
+    const sessionTtlMs = this.getSessionDurationMs()
+    const sessionId = payload.sessionId || null
+
+    await this.cleanupExpired(now)
+
+    if (!sessionId) {
+      await this.advanceQueue(now)
+      await this.scheduleNextAlarm(now)
+      return {
+        decision: 'pass',
+      }
+    }
+
+    const activeSession = this.getSession(sessionId)
+    if (!activeSession || activeSession.expiresAt <= now) {
+      await this.advanceQueue(now)
+      await this.scheduleNextAlarm(now)
+      return {
+        decision: 'pass',
+      }
+    }
+
+    this.sql.exec(
+      `UPDATE sessions SET expires_at = ? WHERE session_id = ?`,
+      now + sessionTtlMs,
+      sessionId,
+    )
+    this.logEvent('session_refreshed', {
+      now,
+      sessionId,
+      sessionExpiresAt: now + sessionTtlMs,
+    })
+    await this.advanceQueue(now)
+    await this.scheduleNextAlarm(now)
+    return {
+      decision: 'refresh',
+      sessionId,
+      sessionExpiresAt: now + sessionTtlMs,
+    }
+  }
+
+  createQueueEntry(existingQueueId, now) {
+    const nextTicket = this.reserveNextTicket()
+    const entry = {
+      queueId: existingQueueId || crypto.randomUUID(),
+      ticket: nextTicket,
+      enqueuedAt: now,
+      lastSeenAt: now,
+    }
+
+    this.sql.exec(
+      `INSERT INTO queue_entries (queue_id, ticket, enqueued_at, last_seen_at)
+       VALUES (?, ?, ?, ?)`,
+      entry.queueId,
+      entry.ticket,
+      entry.enqueuedAt,
+      entry.lastSeenAt,
+    )
+
+    return entry
+  }
+
+  async handleCapacityUpdate(payload) {
+    const totalActiveUsers = parseIntegerSetting(payload?.totalActiveUsers, null, {
+      name: 'totalActiveUsers',
+      min: 0,
+      integerOnly: true,
+    })
+
+    this.sql.exec(
+      `INSERT INTO meta (key, value) VALUES ('capacity', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      totalActiveUsers,
+    )
+    await this.advanceQueue(Date.now())
+    await this.scheduleNextAlarm(Date.now())
+
+    return this.getAdminStats()
+  }
+
+  async cleanupExpired(now) {
+    const expiredSessionIds = this.allRows(
+      `SELECT session_id FROM sessions WHERE expires_at <= ?`,
+      now,
+    ).map(row => row.session_id)
+    if (expiredSessionIds.length > 0) {
+      this.sql.exec(`DELETE FROM sessions WHERE expires_at <= ?`, now)
+      this.logEvent('sessions_expired', {
+        now,
+        expiredSessionCount: expiredSessionIds.length,
+        counters: {
+          sessionExpirations: expiredSessionIds.length,
+        },
+      })
+    }
+
+    const expiredOffers = this.allRows(
+      `SELECT queue_id, ticket FROM offers WHERE expires_at <= ?`,
+      now,
+    )
+    if (expiredOffers.length > 0) {
+      this.sql.exec(`DELETE FROM offers WHERE expires_at <= ?`, now)
+      this.logEvent('offers_expired', {
+        now,
+        expiredOfferCount: expiredOffers.length,
+        counters: {
+          offerExpirations: expiredOffers.length,
+        },
+      })
+    }
+
+    const staleBefore = now - this.getQueueInactivityMs()
+    const staleQueueIds = this.allRows(
+      `SELECT queue_id FROM queue_entries WHERE last_seen_at <= ?`,
+      staleBefore,
+    )
+
+    for (const row of staleQueueIds) {
+      this.sql.exec(`DELETE FROM offers WHERE queue_id = ?`, row.queue_id)
+      this.sql.exec(
+        `DELETE FROM queue_entries WHERE queue_id = ?`,
+        row.queue_id,
+      )
+    }
+
+    if (staleQueueIds.length > 0) {
+      this.logEvent('queue_entries_expired', {
+        now,
+        expiredQueueEntryCount: staleQueueIds.length,
+        counters: {
+          queueExpirations: staleQueueIds.length,
+        },
+      })
+    }
+  }
+
+  async advanceQueue(now) {
+    const capacity = this.getCapacity()
+    const offerDurationMs = this.getOfferDurationMs()
+
+    while (this.getReservedCapacity() < capacity) {
+      const nextEntry = this.firstRow(`
+        SELECT q.queue_id, q.ticket
+        FROM queue_entries q
+        LEFT JOIN offers o ON o.queue_id = q.queue_id
+        WHERE o.queue_id IS NULL
+        ORDER BY q.ticket
+        LIMIT 1
+      `)
+
+      if (!nextEntry) {
+        return
+      }
+
+      this.sql.exec(
+        `INSERT INTO offers (queue_id, ticket, created_at, expires_at)
+         VALUES (?, ?, ?, ?)`,
+        nextEntry.queue_id,
+        nextEntry.ticket,
+        now,
+        now + offerDurationMs,
+      )
+      this.logEvent('offer_issued', {
+        now,
+        queueId: nextEntry.queue_id,
+        ticket: nextEntry.ticket,
+        offerExpiresAt: now + offerDurationMs,
+        counters: {
+          offersIssued: 1,
+        },
+      })
+    }
+  }
+
+  getQueuePosition(ticket) {
+    const position = this.getScalar(
+      `SELECT COUNT(*) AS count FROM queue_entries WHERE ticket <= ?`,
+      'count',
+      ticket,
+    )
+    return Math.max(position, 1)
+  }
+
+  async scheduleNextAlarm(now) {
+    const deadlines = []
+    const nextSessionExpiry = this.getScalar(
+      `SELECT MIN(expires_at) AS value FROM sessions`,
+      'value',
+    )
+    const nextOfferExpiry = this.getScalar(
+      `SELECT MIN(expires_at) AS value FROM offers`,
+      'value',
+    )
+    const nextQueueExpiryBase = this.getScalar(
+      `SELECT MIN(last_seen_at) AS value FROM queue_entries`,
+      'value',
+    )
+
+    if (nextSessionExpiry) {
+      deadlines.push(nextSessionExpiry)
+    }
+    if (nextOfferExpiry) {
+      deadlines.push(nextOfferExpiry)
+    }
+    if (nextQueueExpiryBase) {
+      deadlines.push(nextQueueExpiryBase + this.getQueueInactivityMs())
+    }
+
+    const nextAlarm = deadlines
+      .filter(deadline => deadline > now)
+      .sort((a, b) => a - b)[0]
+
+    if (nextAlarm) {
+      await this.storage.setAlarm(nextAlarm)
+    } else {
+      await this.storage.deleteAlarm()
+    }
+  }
+
+  initializeSchema() {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      );
+    `)
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `)
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS queue_entries (
+        queue_id TEXT PRIMARY KEY,
+        ticket INTEGER NOT NULL UNIQUE,
+        enqueued_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+    `)
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS offers (
+        queue_id TEXT PRIMARY KEY,
+        ticket INTEGER NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `)
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at)`,
+    )
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_queue_entries_ticket ON queue_entries (ticket)`,
+    )
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_queue_entries_last_seen_at ON queue_entries (last_seen_at)`,
+    )
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_offers_expires_at ON offers (expires_at)`,
+    )
+    this.sql.exec(
+      `INSERT OR IGNORE INTO meta (key, value) VALUES ('next_ticket', 1)`,
+    )
+    this.sql.exec(
+      `INSERT OR IGNORE INTO meta (key, value) VALUES ('capacity', ?)`,
+      DEFAULT_TOTAL_ACTIVE_USERS,
     )
   }
 
-  newResponse.headers.append(
-    'Set-Cookie',
-    `${COOKIE_NAME_ID}=${userId}; path=/`,
+  reserveNextTicket() {
+    const current = this.getMetaValue('next_ticket', 1)
+    this.sql.exec(
+      `UPDATE meta SET value = ? WHERE key = 'next_ticket'`,
+      current + 1,
+    )
+    return current
+  }
+
+  getMetaValue(key, fallback) {
+    const row = this.firstRow(`SELECT value FROM meta WHERE key = ?`, key)
+    return row ? row.value : fallback
+  }
+
+  getReservedCapacity() {
+    return (
+      this.getScalar(`SELECT COUNT(*) AS count FROM sessions`, 'count') +
+      this.getScalar(`SELECT COUNT(*) AS count FROM offers`, 'count')
+    )
+  }
+
+  getSession(sessionId) {
+    const row = this.firstRow(
+      `SELECT session_id, created_at, expires_at FROM sessions WHERE session_id = ?`,
+      sessionId,
+    )
+    if (!row) {
+      return null
+    }
+
+    return {
+      sessionId: row.session_id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    }
+  }
+
+  getQueueEntry(queueId) {
+    const row = this.firstRow(
+      `SELECT queue_id, ticket, enqueued_at, last_seen_at
+       FROM queue_entries
+       WHERE queue_id = ?`,
+      queueId,
+    )
+    if (!row) {
+      return null
+    }
+
+    return {
+      queueId: row.queue_id,
+      ticket: row.ticket,
+      enqueuedAt: row.enqueued_at,
+      lastSeenAt: row.last_seen_at,
+    }
+  }
+
+  getOffer(queueId) {
+    const row = this.firstRow(
+      `SELECT queue_id, ticket, created_at, expires_at
+       FROM offers
+       WHERE queue_id = ?`,
+      queueId,
+    )
+    if (!row) {
+      return null
+    }
+
+    return {
+      queueId: row.queue_id,
+      ticket: row.ticket,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    }
+  }
+
+  firstRow(query, ...bindings) {
+    return this.allRows(query, ...bindings)[0] || null
+  }
+
+  allRows(query, ...bindings) {
+    return [...this.sql.exec(query, ...bindings)]
+  }
+
+  getScalar(query, column, ...bindings) {
+    const row = this.firstRow(query, ...bindings)
+    return row?.[column] ?? null
+  }
+
+  getCapacity() {
+    return this.getMetaValue('capacity', DEFAULT_TOTAL_ACTIVE_USERS)
+  }
+
+  getSessionDurationMs() {
+    return this.config.sessionDurationSeconds * 1000
+  }
+
+  getRefreshSeconds() {
+    return this.config.waitingRoomRefreshSeconds
+  }
+
+  getOfferDurationMs() {
+    return this.config.offerDurationSeconds * 1000
+  }
+
+  getQueueInactivityMs() {
+    return this.config.queueInactivitySeconds * 1000
+  }
+
+  getObservabilitySnapshot() {
+    const activeSessions = this.getScalar(
+      `SELECT COUNT(*) AS count FROM sessions`,
+      'count',
+    )
+    const queueDepth = this.getScalar(
+      `SELECT COUNT(*) AS count FROM queue_entries`,
+      'count',
+    )
+    const activeOffers = this.getScalar(
+      `SELECT COUNT(*) AS count FROM offers`,
+      'count',
+    )
+
+    return {
+      activeSessions,
+      queueDepth,
+      activeOffers,
+      reservedCapacity: activeSessions + activeOffers,
+      capacity: this.getCapacity(),
+    }
+  }
+
+  getAdminStats() {
+    const snapshot = this.getObservabilitySnapshot()
+    const nextQueueExpiryBase = this.getScalar(
+      `SELECT MIN(last_seen_at) AS value FROM queue_entries`,
+      'value',
+    )
+
+    return {
+      totalActiveUsers: snapshot.capacity,
+      activeSessions: snapshot.activeSessions,
+      queueDepth: snapshot.queueDepth,
+      activeOffers: snapshot.activeOffers,
+      reservedCapacity: snapshot.reservedCapacity,
+      nextSessionExpiresAt: this.getScalar(
+        `SELECT MIN(expires_at) AS value FROM sessions`,
+        'value',
+      ),
+      nextOfferExpiresAt: this.getScalar(
+        `SELECT MIN(expires_at) AS value FROM offers`,
+        'value',
+      ),
+      nextQueueEntryExpiresAt: nextQueueExpiryBase
+        ? nextQueueExpiryBase + this.getQueueInactivityMs()
+        : null,
+    }
+  }
+
+  logEvent(event, fields = {}) {
+    const eventConfig = OBSERVABILITY_EVENT_CONFIG[event]
+    if (!eventConfig || !this.shouldLogLevel(eventConfig.level)) {
+      return
+    }
+    if (eventConfig.sampleable && !this.shouldSampleEvent()) {
+      return
+    }
+
+    console.log(
+      JSON.stringify({
+        component: OBSERVABILITY_COMPONENT,
+        event,
+        level: eventConfig.level,
+        message: this.getEventMessage(event, fields),
+        ...fields,
+        metrics: this.getObservabilitySnapshot(),
+      }),
+    )
+  }
+
+  shouldLogLevel(level) {
+    return (
+      OBSERVABILITY_LEVELS[this.config.observabilityLogLevel] >=
+      OBSERVABILITY_LEVELS[level]
+    )
+  }
+
+  shouldSampleEvent() {
+    if (this.config.observabilityLogLevel === 'debug') {
+      return true
+    }
+
+    return Math.random() < this.config.observabilitySampleRate
+  }
+
+  getEventMessage(event, fields) {
+    switch (event) {
+      case 'admission_granted':
+        if (fields.admissionSource === 'offer_claim') {
+          return `Queued user ${fields.queueId} claimed an offer and started session ${fields.sessionId}.`
+        }
+        return `New session ${fields.sessionId} started immediately.`
+      case 'session_refreshed':
+        return `Session ${fields.sessionId} refreshed its admission window.`
+      case 'queue_entered':
+        return `New user ${fields.queueId} entered the waiting room queue at ticket ${fields.ticket}.`
+      case 'offer_issued':
+        return `Queue entry ${fields.queueId} received an admission offer at ticket ${fields.ticket}.`
+      case 'sessions_expired':
+        return `${fields.expiredSessionCount} active session(s) expired and capacity was reclaimed.`
+      case 'offers_expired':
+        return `${fields.expiredOfferCount} unclaimed offer(s) expired and were returned to the queue.`
+      case 'queue_entries_expired':
+        return `${fields.expiredQueueEntryCount} inactive queue entr${fields.expiredQueueEntryCount === 1 ? 'y' : 'ies'} expired.`
+      default:
+        return `Waiting room event: ${event}.`
+    }
+  }
+}
+
+async function handleRequest(request, env) {
+  const { pathname } = new URL(request.url)
+  if (pathname.startsWith('/favicon')) {
+    return fetch(request)
+  }
+  if (isAdminRequestPath(pathname)) {
+    return handleAdminRequest(request, env, {
+      applyNoStoreHeaders,
+      getConfig,
+      parseIntegerSetting,
+      timingSafeEqual,
+    })
+  }
+
+  const cookie = parseCookieHeader(request.headers.get('Cookie'))
+  const [sessionId, queueId] = await Promise.all([
+    verifyCookieToken(cookie[COOKIE_NAME_SESSION] || null, 'session', env),
+    verifyCookieToken(cookie[COOKIE_NAME_QUEUE] || null, 'queue', env),
+  ])
+
+  if (request.method === 'POST') {
+    return handlePostRequest(request, env, sessionId)
+  }
+
+  const admission = await callWaitingRoom(env, {
+    sessionId,
+    queueId,
+    path: pathname,
+    now: Date.now(),
+  })
+
+  if (admission.decision === 'admit') {
+    return getDefaultResponse(request, env, admission)
+  }
+
+  return getWaitingRoomResponse(admission, env)
+}
+
+async function handlePostRequest(request, env, sessionId) {
+  if (!sessionId) {
+    return fetchOriginResponse(request, env)
+  }
+
+  const refresh = await callWaitingRoom(env, {
+    mode: 'refresh',
+    sessionId,
+    now: Date.now(),
+  })
+  const response = await fetchOriginResponse(request, env)
+
+  if (refresh.decision !== 'refresh') {
+    return response
+  }
+
+  const newResponse = new Response(response.body, response)
+  applyNoStoreHeaders(newResponse)
+  await appendCookie(
+    newResponse,
+    COOKIE_NAME_SESSION,
+    refresh.sessionId,
+    refresh.sessionExpiresAt,
+    'session',
+    env,
   )
+
   return newResponse
 }
 
-async function getWaitingRoomResponse(userId) {
-  const newResponse = new Response(waiting_room_html)
-  newResponse.headers.set('content-type', 'text/html;charset=UTF-8')
+async function callWaitingRoom(env, payload) {
+  const id = env.WAITING_ROOM.idFromName('global')
+  const stub = env.WAITING_ROOM.get(id)
+  const response = await stub.fetch('https://waiting-room.internal/admit', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Durable Object returned ${response.status}`)
+  }
+
+  return response.json()
+}
+
+async function getDefaultResponse(request, env, admission) {
+  const response = await fetchOriginResponse(request, env)
+  const newResponse = new Response(response.body, response)
+
+  applyNoStoreHeaders(newResponse)
+  await appendCookie(
+    newResponse,
+    COOKIE_NAME_SESSION,
+    admission.sessionId,
+    admission.sessionExpiresAt,
+    'session',
+    env,
+  )
+  clearCookie(newResponse, COOKIE_NAME_QUEUE)
+
   return newResponse
 }
 
+async function fetchOriginResponse(request, env) {
+  return fetch(request)
+}
 
-const waiting_room_html = `
-<title>Waiting Room</title>
-<meta http-equiv='refresh' content='30' />
+async function getWaitingRoomResponse(admission, env) {
+  const response = new Response(renderWaitingRoomHtml(admission), {
+    headers: {
+      'content-type': 'text/html;charset=UTF-8',
+    },
+  })
 
-<style>*{box-sizing:border-box;margin:0;padding:0}body{line-height:1.4;font-size:1rem;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;padding:2rem;display:grid;place-items:center;min-height:100vh}.container{width:100%;max-width:800px}p{margin-top:.5rem}</style>
+  applyNoStoreHeaders(response)
+  await appendCookie(
+    response,
+    COOKIE_NAME_QUEUE,
+    admission.queueId,
+    null,
+    'queue',
+    env,
+  )
+  clearCookie(response, COOKIE_NAME_SESSION)
 
-<div class='container'>
-  <h1>
-    <div>You are now in line.</div>
-    <div>Thanks for your patience.</div>
-  </h1>
-  <p>We are experiencing a high volume of traffic. Please sit tight and we will let you in soon. </p>
-  <p><b>This page will automatically refresh, please do not close your browser.</b></p>
-</div>
-`
+  return response
+}
 
-const default_html = `
-<title>Waiting Room Demo</title>
+function applyNoStoreHeaders(response) {
+  response.headers.set(
+    'Cache-Control',
+    'private, no-store, no-cache, must-revalidate',
+  )
+  response.headers.set('Pragma', 'no-cache')
+  response.headers.set('Expires', '0')
+}
 
-<style>*{box-sizing:border-box;margin:0;padding:0}body{line-height:1.4;font-size:1rem;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;padding:2rem;display:grid;place-items:center;min-height:100vh}.container{width:100%;max-width:800px}p{margin-top:.5rem}</style>
+async function appendCookie(response, name, value, expiresAt, tokenType, env) {
+  const token = await createCookieToken(tokenType, value, expiresAt, env)
+  let cookie = `${name}=${encodeURIComponent(token)}; ${COOKIE_ATTRIBUTES.join(
+    '; ',
+  )}`
+  if (expiresAt) {
+    cookie += `; Max-Age=${Math.max(
+      0,
+      Math.floor((expiresAt - Date.now()) / 1000),
+    )}`
+  }
+  response.headers.append('Set-Cookie', cookie)
+}
 
-<div class="container">
-  <h1>
-    <div>Waiting Room Demo</div>
-  </h1>
-    <p>
-              Visit this site from a different browser, you will be forwarded to the waiting room when the capacity is full.
-    </p>
-  <p>  Check <a href={"https://github.com/upstash/waiting-room"} style={{"color": "blue"}}>this project </a> to set up a waiting room for your website.</p>
-</div>
-`
+function clearCookie(response, name) {
+  response.headers.append(
+    'Set-Cookie',
+    `${name}=; ${COOKIE_ATTRIBUTES.join(
+      '; ',
+    )}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+  )
+}
+
+function json(value) {
+  return new Response(JSON.stringify(value), {
+    headers: { 'content-type': 'application/json;charset=UTF-8' },
+  })
+}
+
+function parseCookieHeader(header) {
+  if (!header) {
+    return {}
+  }
+
+  const cookies = {}
+  for (const part of header.split(';')) {
+    const trimmed = part.trim()
+    if (!trimmed) {
+      continue
+    }
+
+    const separatorIndex = trimmed.indexOf('=')
+    if (separatorIndex === -1) {
+      continue
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim()
+    const value = trimmed.slice(separatorIndex + 1).trim()
+    if (!key) {
+      continue
+    }
+
+    try {
+      cookies[key] = decodeURIComponent(value)
+    } catch {
+      cookies[key] = value
+    }
+  }
+
+  return cookies
+}
+
+async function createCookieToken(type, value, expiresAt, env) {
+  const payload = {
+    type,
+    value,
+    expiresAt: expiresAt ?? null,
+  }
+  const encodedPayload = encodeBase64Url(
+    textEncoder.encode(JSON.stringify(payload)),
+  )
+  const signature = await signCookieToken(
+    `${COOKIE_TOKEN_VERSION}.${encodedPayload}`,
+    env,
+  )
+  return `${COOKIE_TOKEN_VERSION}.${encodedPayload}.${signature}`
+}
+
+async function verifyCookieToken(token, expectedType, env) {
+  if (!token) {
+    return null
+  }
+
+  const parts = token.split('.')
+  if (parts.length !== 3) {
+    return null
+  }
+
+  const [version, encodedPayload, providedSignature] = parts
+  if (
+    version !== COOKIE_TOKEN_VERSION ||
+    !encodedPayload ||
+    !providedSignature
+  ) {
+    return null
+  }
+
+  const expectedSignature = await signCookieToken(
+    `${version}.${encodedPayload}`,
+    env,
+  )
+  if (!timingSafeEqual(expectedSignature, providedSignature)) {
+    return null
+  }
+
+  let payload
+  try {
+    payload = JSON.parse(decodeBase64UrlToText(encodedPayload))
+  } catch {
+    return null
+  }
+
+  if (
+    payload?.type !== expectedType ||
+    typeof payload?.value !== 'string' ||
+    !payload.value
+  ) {
+    return null
+  }
+  if (payload.expiresAt !== null && !Number.isFinite(payload.expiresAt)) {
+    return null
+  }
+  if (
+    typeof payload.expiresAt === 'number' &&
+    payload.expiresAt <= Date.now()
+  ) {
+    return null
+  }
+
+  return payload.value
+}
+
+async function signCookieToken(message, env) {
+  const key = await getCookieSigningKey(env)
+  const signature = await crypto.subtle.sign(
+    COOKIE_TOKEN_ALGORITHM.name,
+    key,
+    textEncoder.encode(message),
+  )
+  return encodeBase64Url(new Uint8Array(signature))
+}
+
+async function getCookieSigningKey(env) {
+  const { cookieSecret: secret } = getConfig(env)
+
+  let keyPromise = signingKeyCache.get(secret)
+  if (!keyPromise) {
+    keyPromise = crypto.subtle.importKey(
+      'raw',
+      textEncoder.encode(secret),
+      COOKIE_TOKEN_ALGORITHM,
+      false,
+      ['sign'],
+    )
+    signingKeyCache.set(secret, keyPromise)
+  }
+
+  return keyPromise
+}
+
+function encodeBase64Url(bytes) {
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+}
+
+function decodeBase64UrlToText(value) {
+  const base64 = value.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = base64.padEnd(
+    base64.length + ((4 - (base64.length % 4)) % 4),
+    '=',
+  )
+  const binary = atob(padded)
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+  return textDecoder.decode(bytes)
+}
+
+function timingSafeEqual(left, right) {
+  if (left.length !== right.length) {
+    return false
+  }
+
+  let result = 0
+  for (let index = 0; index < left.length; index += 1) {
+    result |= left.charCodeAt(index) ^ right.charCodeAt(index)
+  }
+  return result === 0
+}
+
+export function getConfig(env) {
+  let config = configCache.get(env)
+  if (!config) {
+    config = Object.freeze(parseConfig(env))
+    configCache.set(env, config)
+  }
+  return config
+}
+
+function parseConfig(env) {
+  const cookieSecret = env.WAITING_ROOM_COOKIE_SECRET
+  if (typeof cookieSecret !== 'string' || cookieSecret.length < 32) {
+    throw new Error(
+      'WAITING_ROOM_COOKIE_SECRET must be set to at least 32 characters',
+    )
+  }
+
+  const waitingRoomRefreshSeconds = parseIntegerSetting(
+    env.WAITING_ROOM_REFRESH_SECONDS,
+    DEFAULT_CONFIG.waitingRoomRefreshSeconds,
+    {
+      name: 'WAITING_ROOM_REFRESH_SECONDS',
+      min: 1,
+      integerOnly: true,
+    },
+  )
+  const offerDurationSeconds = parseIntegerSetting(
+    env.OFFER_DURATION_SECONDS,
+    waitingRoomRefreshSeconds,
+    {
+      name: 'OFFER_DURATION_SECONDS',
+      min: waitingRoomRefreshSeconds,
+      integerOnly: true,
+      minimumHint: `must be greater than or equal to WAITING_ROOM_REFRESH_SECONDS (${waitingRoomRefreshSeconds})`,
+    },
+  )
+  const queueInactivitySeconds = parseIntegerSetting(
+    env.QUEUE_INACTIVITY_SECONDS,
+    Math.max(waitingRoomRefreshSeconds * 3, 60),
+    {
+      name: 'QUEUE_INACTIVITY_SECONDS',
+      min: waitingRoomRefreshSeconds * 2,
+      integerOnly: true,
+      minimumHint: `must be at least 2x WAITING_ROOM_REFRESH_SECONDS (${waitingRoomRefreshSeconds *
+        2})`,
+    },
+  )
+  const observabilityLogLevel = parseLogLevelSetting(
+    env.OBSERVABILITY_LOG_LEVEL,
+    'info',
+  )
+  const observabilitySampleRate = parseSampleRateSetting(
+    env.OBSERVABILITY_SAMPLE_RATE,
+    1,
+  )
+  const adminSecret = parseAdminSecret(env.WAITING_ROOM_ADMIN_SECRET)
+
+  return {
+    adminSecret,
+    cookieSecret,
+    sessionDurationSeconds: parseIntegerSetting(
+      env.SESSION_DURATION_SECONDS,
+      DEFAULT_CONFIG.sessionDurationSeconds,
+      {
+        name: 'SESSION_DURATION_SECONDS',
+        min: 1,
+        integerOnly: true,
+      },
+    ),
+    waitingRoomRefreshSeconds,
+    offerDurationSeconds,
+    queueInactivitySeconds,
+    observabilityLogLevel,
+    observabilitySampleRate,
+  }
+}
+
+function parseAdminSecret(value) {
+  if (value === undefined || value === null || value === '') {
+    return null
+  }
+  if (typeof value !== 'string' || value.length < 16) {
+    throw new Error(
+      'WAITING_ROOM_ADMIN_SECRET must be at least 16 characters when set',
+    )
+  }
+  return value
+}
+
+function parseIntegerSetting(value, fallback, options) {
+  if (value === undefined || value === null || value === '') {
+    return fallback
+  }
+
+  if (typeof value === 'string' && !/^-?\d+$/.test(value.trim())) {
+    throw new Error(`${options.name} must be an integer`)
+  }
+
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${options.name} must be an integer`)
+  }
+  if (parsed < options.min) {
+    throw new Error(
+      options.minimumHint
+        ? `${options.name} ${options.minimumHint}`
+        : `${options.name} must be >= ${options.min}`,
+    )
+  }
+
+  return parsed
+}
+
+function parseLogLevelSetting(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback
+  }
+
+  const normalized = String(value).trim().toLowerCase()
+  if (!(normalized in OBSERVABILITY_LEVELS)) {
+    throw new Error(
+      'OBSERVABILITY_LOG_LEVEL must be one of: none, error, info, debug',
+    )
+  }
+
+  return normalized
+}
+
+function parseSampleRateSetting(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback
+  }
+
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    throw new Error('OBSERVABILITY_SAMPLE_RATE must be a number between 0 and 1')
+  }
+
+  return parsed
+}

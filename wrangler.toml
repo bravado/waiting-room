@@ -1,13 +1,32 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
 name = "waiting-room"
-type = "webpack"
-
-account_id = "REPLACE_HERE"
-compatibility_date = "2022-03-16"
-route = ""
+main = "index.js"
+compatibility_date = "2026-06-09"
 workers_dev = true
-zone_id = ""
+
 [vars]
-UPSTASH_REDIS_REST_TOKEN = "REPLACE_HERE"
-UPSTASH_REDIS_REST_URL = "REPLACE_HERE"
-TOTAL_ACTIVE_USERS = 10
 SESSION_DURATION_SECONDS = 30
+WAITING_ROOM_REFRESH_SECONDS = 20
+OFFER_DURATION_SECONDS = 20
+QUEUE_INACTIVITY_SECONDS = 60
+OBSERVABILITY_LOG_LEVEL = "debug"
+OBSERVABILITY_SAMPLE_RATE = "1.0"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+
+[dev]
+host = "127.0.0.1:8080"
+upstream_protocol = "http"
+
+[[durable_objects.bindings]]
+name = "WAITING_ROOM"
+class_name = "WaitingRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WaitingRoom"]

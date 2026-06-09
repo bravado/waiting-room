@@ -1,5 +1,6 @@
 /target
 /dist
+/.wrangler
 **/*.rs.bk
 Cargo.lock
 bin/
@@ -10,3 +11,7 @@ node_modules/
 .cargo-ok
 
 .idea
+.dev.vars
+.dev.vars.*
+.env
+.env.*
