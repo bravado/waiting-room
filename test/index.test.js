@@ -11,10 +11,12 @@ const BASE_TIME_MS = 1_700_000_000_000
 class SqlStorageAdapter {
   constructor() {
     this.database = new DatabaseSync(':memory:')
+    this.queries = []
   }
 
   exec(query, ...bindings) {
     const trimmed = query.trim()
+    this.queries.push(trimmed.replace(/\s+/g, ' '))
 
     if (
       bindings.length === 0 &&
@@ -34,6 +36,14 @@ class SqlStorageAdapter {
     return []
   }
 
+  countQueriesMatching(pattern) {
+    return this.queries.filter(query => pattern.test(query)).length
+  }
+
+  clearQueries() {
+    this.queries = []
+  }
+
   close() {
     this.database.close()
   }
@@ -43,14 +53,22 @@ class FakeStorage {
   constructor() {
     this.sql = new SqlStorageAdapter()
     this.alarm = null
+    this.setAlarmCount = 0
+    this.deleteAlarmCount = 0
   }
 
   async setAlarm(timestamp) {
     this.alarm = timestamp
+    this.setAlarmCount += 1
   }
 
   async deleteAlarm() {
     this.alarm = null
+    this.deleteAlarmCount += 1
+  }
+
+  transactionSync(callback) {
+    return callback()
   }
 }
 
@@ -224,6 +242,23 @@ function createHarness(envOverrides = {}) {
   }
 }
 
+function createOverloadedDurableObjectBinding() {
+  return {
+    idFromName(name) {
+      return name
+    },
+    get() {
+      return {
+        fetch: async () => {
+          throw new Error(
+            'Durable Object is overloaded. Requests queued for too long.',
+          )
+        },
+      }
+    },
+  }
+}
+
 test('worker covers admission, queue advancement, claim, timeout recovery, and expiry', async () => {
   const harness = createHarness({
     OBSERVABILITY_LOG_LEVEL: 'debug',
@@ -261,7 +296,7 @@ test('worker covers admission, queue advancement, claim, timeout recovery, and e
         clientB,
         BASE_TIME_MS + 20_000,
       )
-      assert.match(await queuedResponseB.text(), /Your current position:<\/b> 1/)
+      assert.match(await queuedResponseB.text(), /:<\/b>\s*1</)
       assert.ok(clientB.get(COOKIE_NAME_QUEUE))
       assert.equal(clientB.get(COOKIE_NAME_SESSION), null)
 
@@ -270,7 +305,7 @@ test('worker covers admission, queue advancement, claim, timeout recovery, and e
         clientC,
         BASE_TIME_MS + 21_000,
       )
-      assert.match(await queuedResponseC.text(), /Your current position:<\/b> 2/)
+      assert.match(await queuedResponseC.text(), /:<\/b>\s*2</)
       assert.ok(clientC.get(COOKIE_NAME_QUEUE))
 
       await harness.runAlarm(BASE_TIME_MS + 41_000)
@@ -303,7 +338,7 @@ test('worker covers admission, queue advancement, claim, timeout recovery, and e
         clientC,
         BASE_TIME_MS + 63_000,
       )
-      assert.match(await waitingResponseC.text(), /Your current position:<\/b> 1/)
+      assert.match(await waitingResponseC.text(), /:<\/b>\s*1</)
 
       await harness.runAlarm(BASE_TIME_MS + 93_000)
       assert.equal(
@@ -329,14 +364,6 @@ test('worker covers admission, queue advancement, claim, timeout recovery, and e
           entry.message.includes('started') &&
           entry.admissionSource === 'immediate' &&
           entry.counters?.admissions === 1 &&
-          entry.metrics.activeSessions === 1,
-      ),
-    )
-    assert.ok(
-      logs.some(
-        entry =>
-          entry.event === 'session_refreshed' &&
-          entry.message.includes('refreshed') &&
           entry.metrics.activeSessions === 1,
       ),
     )
@@ -417,8 +444,8 @@ test('debug observability bypasses sampling and logs all events', async () => {
     await withMockedRandom(0.5, async () => {
       await withCapturedLogs(logs, async () => {
         await harness.request('/sale', clientA, BASE_TIME_MS)
-        await harness.request('/sale', clientA, BASE_TIME_MS + 10_000)
-        await harness.request('/sale', clientB, BASE_TIME_MS + 20_000)
+        await harness.request('/sale', clientA, BASE_TIME_MS + 21_000)
+        await harness.request('/sale', clientB, BASE_TIME_MS + 22_000)
       })
     })
 
@@ -443,6 +470,290 @@ test('favicon requests bypass the waiting room durable object', async () => {
   }
 })
 
+test('valid session refreshes bypass the durable object until near expiry', async () => {
+  const harness = createHarness()
+  const client = new CookieJar()
+
+  try {
+    const admittedResponse = await harness.request('/sale', client, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+    assert.equal(harness.durableFetchCount, 1)
+
+    const sessionRow = harness.room.allRows(
+      `SELECT session_id, expires_at FROM sessions`,
+    )[0]
+
+    const earlyRefreshResponse = await harness.request(
+      '/sale',
+      client,
+      BASE_TIME_MS + 10_000,
+    )
+    assert.equal(await earlyRefreshResponse.text(), 'GET:origin:/sale')
+    assert.equal(harness.durableFetchCount, 1)
+    assert.equal(earlyRefreshResponse.headers.getSetCookie().length, 0)
+    assert.deepEqual(
+      harness.room.allRows(`SELECT session_id, expires_at FROM sessions`)[0],
+      sessionRow,
+    )
+
+    const nearExpiryResponse = await harness.request(
+      '/sale',
+      client,
+      BASE_TIME_MS + 21_000,
+    )
+    assert.equal(await nearExpiryResponse.text(), 'GET:origin:/sale')
+    assert.equal(harness.durableFetchCount, 2)
+    assert.equal(
+      harness.room.allRows(`SELECT expires_at FROM sessions`)[0].expires_at,
+      BASE_TIME_MS + 51_000,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
+test('durable object overload degrades active refreshes instead of returning 500', async () => {
+  const harness = createHarness()
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+
+    harness.env.WAITING_ROOM = createOverloadedDurableObjectBinding()
+
+    const admittedRefresh = await harness.request(
+      '/sale',
+      clientA,
+      BASE_TIME_MS + 21_000,
+    )
+    assert.equal(admittedRefresh.status, 200)
+    assert.equal(await admittedRefresh.text(), 'GET:origin:/sale')
+
+    const queuedRefresh = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 2_000,
+    )
+    assert.equal(queuedRefresh.status, 200)
+    assert.match(await queuedRefresh.text(), /fila de espera|now in line/i)
+    assert.ok(clientB.get(COOKIE_NAME_QUEUE))
+  } finally {
+    harness.close()
+  }
+})
+
+test('queue position cache avoids repeated position count queries', async () => {
+  const harness = createHarness({
+    SESSION_DURATION_SECONDS: '300',
+    QUEUE_POSITION_CACHE_SECONDS: '60',
+  })
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const positionQueryPattern =
+    /SELECT COUNT\(\*\) AS count FROM queue_entries WHERE ticket <= \?/
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(positionQueryPattern),
+      1,
+    )
+
+    const cachedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 20_000,
+    )
+    assert.match(await cachedResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(positionQueryPattern),
+      1,
+    )
+
+    const refreshedCacheResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 62_000,
+    )
+    assert.match(await refreshedCacheResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(positionQueryPattern),
+      2,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
+test('request paths do not run broad stale queue cleanup scans', async () => {
+  const harness = createHarness()
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const staleQueueScanPattern =
+    /SELECT queue_id FROM queue_entries WHERE last_seen_at <= \?/
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(staleQueueScanPattern),
+      0,
+    )
+
+    const queuedRefreshResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 20_000,
+    )
+    assert.match(await queuedRefreshResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(staleQueueScanPattern),
+      0,
+    )
+
+    await harness.runAlarm(BASE_TIME_MS + 200_000)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(staleQueueScanPattern),
+      3,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
+test('queued heartbeat writes are throttled', async () => {
+  const harness = createHarness({
+    QUEUE_HEARTBEAT_WRITE_SECONDS: '20',
+  })
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const heartbeatUpdatePattern =
+    /UPDATE queue_entries SET last_seen_at = \? WHERE queue_id = \?/
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(heartbeatUpdatePattern),
+      0,
+    )
+    assert.equal(
+      harness.room.allRows(`SELECT last_seen_at FROM queue_entries`)[0]
+        .last_seen_at,
+      BASE_TIME_MS + 1_000,
+    )
+
+    const earlyRefreshResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 10_000,
+    )
+    assert.match(await earlyRefreshResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(heartbeatUpdatePattern),
+      0,
+    )
+    assert.equal(
+      harness.room.allRows(`SELECT last_seen_at FROM queue_entries`)[0]
+        .last_seen_at,
+      BASE_TIME_MS + 1_000,
+    )
+
+    const throttledRefreshResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 22_000,
+    )
+    assert.match(await throttledRefreshResponse.text(), /:<\/b>\s*1</)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(heartbeatUpdatePattern),
+      1,
+    )
+    assert.equal(
+      harness.room.allRows(`SELECT last_seen_at FROM queue_entries`)[0]
+        .last_seen_at,
+      BASE_TIME_MS + 22_000,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
+test('unchanged queued refreshes skip alarm rescheduling and capacity expiry scans', async () => {
+  const harness = createHarness({
+    QUEUE_HEARTBEAT_WRITE_SECONDS: '20',
+  })
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const alarmDeadlinePattern = /SELECT MIN\((expires_at|last_seen_at)\) AS value/
+  const capacityExpiryScanPattern =
+    /SELECT (session_id FROM sessions|queue_id, ticket FROM offers) WHERE expires_at <= \?/
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+
+    const setAlarmCountBefore = harness.state.storage.setAlarmCount
+    harness.state.storage.sql.clearQueries()
+
+    const queuedRefreshResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 10_000,
+    )
+    assert.match(await queuedRefreshResponse.text(), /:<\/b>\s*1</)
+    assert.equal(harness.state.storage.setAlarmCount, setAlarmCountBefore)
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(alarmDeadlinePattern),
+      0,
+    )
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(capacityExpiryScanPattern),
+      0,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
 test('post requests bypass queueing and do not create sessions', async () => {
   const harness = createHarness()
   const clientA = new CookieJar()
@@ -457,7 +768,7 @@ test('post requests bypass queueing and do not create sessions', async () => {
       clientB,
       BASE_TIME_MS + 1_000,
     )
-    assert.match(await queuedResponse.text(), /Your current position:<\/b> 1/)
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
 
     const sessionCountBeforePost =
       harness.room.allRows(`SELECT COUNT(*) AS count FROM sessions`)[0].count
@@ -486,7 +797,7 @@ test('post requests bypass queueing and do not create sessions', async () => {
   }
 })
 
-test('post requests refresh an existing valid session without creating a new one', async () => {
+test('post requests near session expiry refresh without creating a new one', async () => {
   const harness = createHarness()
   const client = new CookieJar()
 
@@ -500,7 +811,7 @@ test('post requests refresh an existing valid session without creating a new one
     const postResponse = await harness.postRequest(
       '/checkout',
       client,
-      BASE_TIME_MS + 10_000,
+      BASE_TIME_MS + 21_000,
       'order=1',
     )
     assert.equal(await postResponse.text(), 'POST:origin:/checkout')
@@ -509,7 +820,7 @@ test('post requests refresh an existing valid session without creating a new one
       `SELECT session_id, expires_at FROM sessions`,
     )[0]
     assert.equal(refreshedSessionRow.session_id, sessionRow.session_id)
-    assert.equal(refreshedSessionRow.expires_at, BASE_TIME_MS + 40_000)
+    assert.equal(refreshedSessionRow.expires_at, BASE_TIME_MS + 51_000)
     assert.ok(client.get(COOKIE_NAME_SESSION))
     assertCookieHasSecurityAttributes(
       postResponse.headers
@@ -539,14 +850,14 @@ test('admin capacity updates apply without redeploy and preserve queue order', a
       clientB,
       BASE_TIME_MS + 1_000,
     )
-    assert.match(await queuedResponseB.text(), /Your current position:<\/b> 1/)
+    assert.match(await queuedResponseB.text(), /:<\/b>\s*1</)
 
     const queuedResponseC = await harness.request(
       '/sale',
       clientC,
       BASE_TIME_MS + 2_000,
     )
-    assert.match(await queuedResponseC.text(), /Your current position:<\/b> 2/)
+    assert.match(await queuedResponseC.text(), /:<\/b>\s*2</)
 
     const updateResponse = await harness.adminRequest(
       'POST',
@@ -584,7 +895,7 @@ test('admin capacity updates apply without redeploy and preserve queue order', a
       clientC,
       BASE_TIME_MS + 5_000,
     )
-    assert.match(await waitingResponseC.text(), /Your current position:<\/b> 1/)
+    assert.match(await waitingResponseC.text(), /:<\/b>\s*1</)
 
     const capacityResponse = await harness.adminRequest(
       'GET',
@@ -602,8 +913,88 @@ test('admin capacity updates apply without redeploy and preserve queue order', a
       reservedCapacity: 2,
       nextSessionExpiresAt: BASE_TIME_MS + 30_000,
       nextOfferExpiresAt: null,
-      nextQueueEntryExpiresAt: BASE_TIME_MS + 125_000,
+      nextQueueEntryExpiresAt: BASE_TIME_MS + 122_000,
     })
+  } finally {
+    harness.close()
+  }
+})
+
+test('admin stats use cached counters instead of aggregate count queries', async () => {
+  const harness = createHarness()
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const adminHeaders = {
+    Authorization: 'Bearer admin-secret-123',
+  }
+  const aggregateCountPattern =
+    /SELECT COUNT\(\*\) AS count FROM (sessions|offers|queue_entries)$/
+
+  try {
+    const admittedResponse = await harness.request('/sale', clientA, BASE_TIME_MS)
+    assert.equal(await admittedResponse.text(), 'GET:origin:/sale')
+
+    const queuedResponse = await harness.request(
+      '/sale',
+      clientB,
+      BASE_TIME_MS + 1_000,
+    )
+    assert.match(await queuedResponse.text(), /:<\/b>\s*1</)
+
+    harness.state.storage.sql.clearQueries()
+    const capacityResponse = await harness.adminRequest(
+      'GET',
+      '/_waiting-room/admin/capacity',
+      undefined,
+      BASE_TIME_MS + 2_000,
+      adminHeaders,
+    )
+    assert.equal(capacityResponse.status, 200)
+    assert.deepEqual(await capacityResponse.json(), {
+      totalActiveUsers: 1,
+      activeSessions: 1,
+      queueDepth: 1,
+      activeOffers: 0,
+      reservedCapacity: 1,
+      nextSessionExpiresAt: BASE_TIME_MS + 30_000,
+      nextOfferExpiresAt: null,
+      nextQueueEntryExpiresAt: BASE_TIME_MS + 121_000,
+    })
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(aggregateCountPattern),
+      0,
+    )
+  } finally {
+    harness.close()
+  }
+})
+
+test('durable object mutation paths do not execute SQL transaction statements', async () => {
+  const harness = createHarness()
+  const clientA = new CookieJar()
+  const clientB = new CookieJar()
+  const adminHeaders = {
+    Authorization: 'Bearer admin-secret-123',
+  }
+  const sqlTransactionPattern = /^(BEGIN|COMMIT|ROLLBACK)\b/
+
+  try {
+    await harness.request('/sale', clientA, BASE_TIME_MS)
+    await harness.request('/sale', clientB, BASE_TIME_MS + 1_000)
+    await harness.adminRequest(
+      'POST',
+      '/_waiting-room/admin/capacity',
+      { totalActiveUsers: 2 },
+      BASE_TIME_MS + 2_000,
+      adminHeaders,
+    )
+    await harness.request('/sale', clientB, BASE_TIME_MS + 3_000)
+    await harness.runAlarm(BASE_TIME_MS + 40_000)
+
+    assert.equal(
+      harness.state.storage.sql.countQueriesMatching(sqlTransactionPattern),
+      0,
+    )
   } finally {
     harness.close()
   }
@@ -627,7 +1018,7 @@ test('new arrivals claim newly issued offers in the same request when spare capa
       clientB,
       BASE_TIME_MS + 1_000,
     )
-    assert.match(await queuedResponseB.text(), /Your current position:<\/b> 1/)
+    assert.match(await queuedResponseB.text(), /:<\/b>\s*1</)
 
     const updateResponse = await harness.adminRequest(
       'POST',
@@ -739,6 +1130,26 @@ test('config validation rejects invalid ranges before handling traffic', () => {
         OBSERVABILITY_SAMPLE_RATE: '1.5',
       }),
     /OBSERVABILITY_SAMPLE_RATE/,
+  )
+
+  assert.throws(
+    () =>
+      getConfig({
+        WAITING_ROOM_COOKIE_SECRET: '12345678901234567890123456789012',
+        QUEUE_POSITION_CACHE_SECONDS: '0',
+      }),
+    /QUEUE_POSITION_CACHE_SECONDS/,
+  )
+
+  assert.throws(
+    () =>
+      getConfig({
+        WAITING_ROOM_COOKIE_SECRET: '12345678901234567890123456789012',
+        WAITING_ROOM_REFRESH_SECONDS: '20',
+        QUEUE_INACTIVITY_SECONDS: '60',
+        QUEUE_HEARTBEAT_WRITE_SECONDS: '60',
+      }),
+    /QUEUE_HEARTBEAT_WRITE_SECONDS/,
   )
 
   assert.throws(
